@@ -84,12 +84,14 @@ class ParamsModel:
 #          C1: 9 - 8.07 = 0.93   |  C2: 11 - 10.96 = 0.04
 # com isso, uma UC será removida do cluster C1 (irá para 8 UCS).
 def get_distributing(
-    NUM_UCS: int, y_pred: List[int], total_amount_deliveries: int, num_clusters: int 
+    NUM_UCS: int, y_pred: List[int], num_clusters: int 
 ) -> Tuple[list, Dict[int, int]]:
 
+    total_amount_deliveries = len(y_pred)
     unique, counts = np.unique(y_pred, return_counts=True)
     no_rounding = {i: NUM_UCS * counts[i]/total_amount_deliveries for i in range(num_clusters)}
-    rounding = {i: int(np.ceil(NUM_UCS * counts[i]/total_amount_deliveries)) for i in range(num_clusters)}
+    rounding = {i: int(np.ceil(NUM_UCS * counts[i]/total_amount_deliveries)) 
+                for i in range(num_clusters)}
     sum_distribute = sum(filter(lambda elem:elem,(map(lambda dic:int(dic),rounding.values()))))
     max = -1 ; removes = []
 
@@ -172,9 +174,9 @@ def pretrain(
 
     y_pred = clustering.fit_predict(points)
 
-    list_distribute, dict_distribute = get_distributing(params.NUM_UCS, y_pred, len(points), num_clusters)
+    list_distribute, dict_distribute = get_distributing(params.NUM_UCS, y_pred, num_clusters)
     # list_distribute, dict_distribute = get_distributing2(params.NUM_UCS, y_pred)
-    
+
     # criando modelos do segundo nivel da clusterização
     subclusterings = [KMeans(dict_distribute[i], init='k-means++', random_state=params.seed)
                         .fit(points[np.in1d(y_pred, [0])]) for i in range(num_clusters) ]
