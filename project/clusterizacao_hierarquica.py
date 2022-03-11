@@ -1,17 +1,16 @@
 import logging
 import os
-
-import time
-from dataclasses import dataclass
-from typing import Optional, List, Dict
 from multiprocessing import Pool, Manager
+from pickle import LIST
+from tqdm import tqdm
+
 from argparse import ArgumentParser
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Tuple
 
 import numpy as np
-from sklearn.cluster import KMeans, MiniBatchKMeans
-from tqdm import tqdm
-from copy import deepcopy
+from sklearn.cluster import KMeans
 
 from loggibud.v1.types import (
     CVRPInstance,
@@ -26,21 +25,39 @@ from loggibud.v1.baselines.shared.ortools import (
     ORToolsParams,
 )
 
-import matplotlib.pyplot as plt
-from project.utils import create_instanceCVRP, createUC, dictOffilinePA0, dictOffilineDF0, dictOffilineRJ0
-from math import sqrt
 from loggibud.v1.eval.task1 import evaluate_solution
+
+from project.utils import (
+    dictOffilineDF0, 
+    dictOffilinePA0,
+)
+
+import matplotlib.pyplot as plt
 
 logger = logging.getLogger(__name__)
 
 @dataclass
-class CHParams(JSONDataclassMixin):
+class UCModel:
+    C: int
+    phi: List[Delivery]
+    deliveries: List[Delivery]
+
+    @classmethod
+    def get_baseline(cls):
+        return cls(
+            C= 0,
+            phi= [],
+            deliveries= []
+        )
+
+@dataclass
+class Params(JSONDataclassMixin):
     num_clusters: Optional[int] = None
     ortools_tsp_params: Optional[ORToolsParams] = ORToolsParams(
                 max_vehicles=1,
                 time_limit_ms=1_000,
             )
-    num_ucs: Optional[int] = 28
+    NUM_UCS: Optional[int] = 28
     seed: int = 0
     @classmethod
     def get_baseline(cls):
@@ -53,73 +70,65 @@ class CHParams(JSONDataclassMixin):
         )
 
 @dataclass
-class CHModel:
-    params: CHParams
+class ParamsModel:
+    params: Params
     clustering: KMeans
+    subclustering: Optional[List[KMeans]] = None
+    subinstance: Optional[CVRPInstance] = None
+    list_distribute: Optional[List[int]] = None
+    dict_distribute: Optional[Dict[int, int]] = None
 
 
-def pretrain(
-    instances: List[CVRPInstance], params: Optional[CHParams] = None
-) -> CHModel:
-    params = params or CHParams.get_baseline()
+# o balanceamento busca remover UC de um cluster que está mais longe do numero anterior.
+# exemplo: C1: 8.07 UCS (ceil -> 9 UCS)  | C2: 10.96 (ceil -> 11 UCS)
+#          C1: 9 - 8.07 = 0.93   |  C2: 11 - 10.96 = 0.04
+# com isso, uma UC será removida do cluster C1 (irá para 8 UCS).
+def get_distributing(
+    NUM_UCS: int, y_pred: List[int], total_amount_deliveries: int, num_clusters: int 
+) -> Tuple[list, Dict[int, int]]:
 
-    points = np.array(
-        [
-            [d.point.lng, d.point.lat]
-            for instance in instances
-            for d in instance.deliveries
-        ]
-    )
+    unique, counts = np.unique(y_pred, return_counts=True)
+    no_rounding = {i: NUM_UCS * counts[i]/total_amount_deliveries for i in range(num_clusters)}
+    rounding = {i: int(np.ceil(NUM_UCS * counts[i]/total_amount_deliveries)) for i in range(num_clusters)}
+    sum_distribute = sum(filter(lambda elem:elem,(map(lambda dic:int(dic),rounding.values()))))
+    max = -1 ; removes = []
 
-    num_clusters = params.num_clusters if params.num_clusters else metodoCotovelo(points)
+    while sum_distribute > NUM_UCS:
+        for i in range(num_clusters):
+            aux = rounding[i] - no_rounding[i]
+            if aux > max and rounding[i] > 1 and i not in removes:
+                max = aux
+                remove_cluster = i
+        removes.append(remove_cluster)
+        if max == -1:
+            removes = []
+        else:
+            rounding[remove_cluster] = rounding[remove_cluster] - 1
+            no_rounding[remove_cluster] = no_rounding[remove_cluster] - 1
+            sum_distribute = sum_distribute - 1 ; max = -1
+    
+    rounding = {i: rounding[i] for i in sorted(rounding, key=rounding.get, reverse=True)}
+    distribute = [i for i in rounding for j in range(rounding[i])]
 
-    logger.info(f"Clustering instance into {num_clusters} subinstances")
-    clustering = KMeans(num_clusters, random_state=params.seed)
-    clustering.fit(points)
-
-    return CHModel(
-        params=params,
-        clustering=clustering,
-    )
-
-
-def numero_cluster(error_rate):
-    x1, y1 = 1, error_rate[0]
-    x2, y2 = 28, error_rate[len(error_rate)-1]
-    logger.info("Calculando as distancias referente ao error_rate")
-    distances = []
-    for i in range(len(error_rate)):
-        x0 = i+2
-        y0 = error_rate[i]
-        numerator = abs((y2 - y1)*x0 - (x2 - x1)*y0 + x2*y1 - y2*x1)
-        denominator = sqrt((y2 - y1)**2 + (x2 - x1)**2)
-        distances.append(numerator/denominator)
-    logger.info("Retornando o número de cluster.")
-    return distances.index(max(distances)) + 2
+    return distribute, rounding
 
 
-def metodoCotovelo(points):
-    logger.info("Calculando o error_rate")
-    error_rate = []
-    for i in range(2,29):
-        kmeans = KMeans(n_clusters=i)
-        kmeans.fit(points)
-        error_rate.append(kmeans.inertia_)
-    #name = "error_rate_df-0"
-    #logger.info("Plotando o error_rate")
-
-    #plt.plot(range(2, 29), error_rate, color="blue")
-    #plt.savefig (name)
-    return numero_cluster(error_rate)
-
-
-
-def distributing(m: int, tamClusters: List[int], sum_p: int, ordenado: List[int]):
-    arredondamento = {i: int(np.ceil(m * tamClusters[i]/sum_p)) for i in ordenado}
+# o balanceamento busca remover UC do primeiro cluster que tem mais que uma UC.
+# exemplo: C1: 10   |   C2: 3    |   C3:   1    |    C4: 2
+# sera removido uma UC do cluster C4
+def get_distributing2(
+    NUM_UCS: int, y_pred: List[int]
+):
+    unique, counts = np.unique(y_pred, return_counts=True)
+    tam_pools = {i: counts[i] for i in range(len(counts))}
+    ordenado = sorted(tam_pools, key = tam_pools.get, reverse=True)
+    sum_clusters = sum([counts[i] for i in range(len(counts))])
+    
+    arredondamento = {i: int(np.ceil(NUM_UCS * counts[i]/sum_clusters)) for i in ordenado}
     soma = sum(filter(lambda elem:elem,(map(lambda dic:int(dic),arredondamento.values()))))
     xy = sorted(arredondamento, key=arredondamento.get)
 
-    while soma != m:
+    while soma != NUM_UCS:
         for i in xy:
             if arredondamento[i] > 1:
                 arredondamento[i] = arredondamento[i] - 1
@@ -141,113 +150,106 @@ def distributing(m: int, tamClusters: List[int], sum_p: int, ordenado: List[int]
 
 
 
-def uc_distribute(m: int, tamClusters: List[int]):
-    tam_pools = {i: tamClusters[i] for i in range(len(tamClusters))}
-    ordenado = sorted(tam_pools, key = tam_pools.get, reverse=True)
-    sum_clusters = sum([tamClusters[i] for i in range(len(tamClusters))])
-    distribuicao, dictDistribuicao = distributing(m, tamClusters, sum_clusters, ordenado) # [1, 0, 2, 4]
-    return distribuicao, dictDistribuicao
+
+def pretrain(
+    instances: List[CVRPInstance], params: Optional[Params] = None
+) -> ParamsModel:
+    params = params or Params.get_baseline()
+
+    points = np.array(
+        [
+            [d.point.lng, d.point.lat]
+            for instance in instances
+            for d in instance.deliveries
+        ]
+    )
+
+    num_clusters = params.num_clusters
+
+    # criando modelo do primeiro nivel da clusterização
+    logger.info(f"Clustering instance into {num_clusters} subinstances")
+    clustering = KMeans(num_clusters, init='k-means++', random_state=params.seed)
+
+    y_pred = clustering.fit_predict(points)
+
+    list_distribute, dict_distribute = get_distributing(params.NUM_UCS, y_pred, len(points), num_clusters)
+    # list_distribute, dict_distribute = get_distributing2(params.NUM_UCS, y_pred)
+    
+    # criando modelos do segundo nivel da clusterização
+    subclusterings = [KMeans(dict_distribute[i], init='k-means++', random_state=params.seed)
+                        .fit(points[np.in1d(y_pred, [0])]) for i in range(num_clusters) ]
+
+    print(dict_distribute)
+    print(subclusterings)
+    return ParamsModel(
+        params=params,
+        list_distribute=list_distribute,
+        dict_distribute=dict_distribute,
+        clustering=clustering,
+        subclustering=subclusterings,
+    )
+
+def instances_icvrp(
+    instance: CVRPInstance, model: ParamsModel, UCS: List[UCModel], instances_cvrp: List[CVRPInstance]
+) -> List[CVRPInstance]:
+    # ucs restantes que nao atingiram a capacidade Q
+    for i in range(model.clustering.n_clusters): 
+        sub = [j for j in range(len(model.list_distribute)) if model.list_distribute[j]==i]
+        for j in sub:
+            if len(UCS[j].deliveries) > 0:
+                inst = CVRPInstance(name = instance.name,
+                                    region= "",
+                                    origin= instance.origin,
+                                    vehicle_capacity = 3 * instance.vehicle_capacity,
+                                    deliveries= UCS[j].deliveries
+                                )
+                instances_cvrp.append(inst)
+    return instances_cvrp
 
 
-def modelsUC(instances: List[CVRPInstance], dictDistribuicao: Dict) -> List[KMeans]:
-    models = []
-    for cluster in range(len(instances)):
-        points = []
-        print(cluster)
-        for delivery in instances[cluster].deliveries:
-            points.append([delivery.point.lng, delivery.point.lat])
-        modelUC = KMeans(n_clusters=dictDistribuicao[cluster], random_state=0).fit(points)
-        models.append(modelUC)
-
-    return models
-
+def solutions_icvrp(
+    model: ParamsModel, instances_cvrp: List[CVRPInstance], solutions_cvrp: List[CVRPSolution]
+) -> List[CVRPSolution] :
+    for inst in instances_cvrp:
+        sol = ortools_solve(inst, model.params.ortools_tsp_params)# TSP
+        while not isinstance(sol, CVRPSolution):
+            print(f"SOLUÇÃO NONETYPE. Buscando novamente. {inst.name}")
+            sol = ortools_solve(inst, model.params.ortools_tsp_params)# TSP
+        solutions_cvrp.append(CVRPSolutionVehicle(inst.origin, sol.deliveries))
+    return solutions_cvrp
 
 
-def modelsUC2(deliveries: List[Delivery], dictDistribuicao: Dict, num_clusters: int, pointsClusters) -> List[KMeans]:
-    models = [KMeans(n_clusters=dictDistribuicao[cluster], random_state=0) for cluster in range(num_clusters) ]
-    for cluster in range(num_clusters):
-        models[cluster].fit(pointsClusters[cluster])
-    return models
-
-
-
-def qtdClusters(deliveries, model):
-    soma = [0 for i in range(model.clustering.n_clusters)]
-    pointsClusters = [[] for cluster in range(model.clustering.n_clusters) ]
-
-    for delivery in deliveries:
-        point = [delivery.point.lng, delivery.point.lat]
-        cluster = model.clustering.predict([point])[0]
-        soma[cluster] += 1
-        pointsClusters[cluster].append(point)
-
-    return soma, pointsClusters
-
-
-
-def aloc(instance: CVRPInstance, model: CHModel, 
-params: CHParams, distribuicao: List[int], models: List[KMeans]) -> CVRPSolution:
-    UCS = [createUC() for i in range(params.num_ucs)]
-    R = [] # conjunto de entregas   
-    Q = instance.vehicle_capacity # capacidade das ucs
-    vehicles = []
+def alocation(instance: CVRPInstance, model: ParamsModel) -> CVRPSolution:
+    UCS = [UCModel.get_baseline() for i in range(model.params.NUM_UCS)]
+    instances_cvrp = [] ; solutions_cvrp = [] #  # conjunto de entregas e soluções
 
     for delivery in instance.deliveries:
-        #predict
-        point = [delivery.point.lng, delivery.point.lat]
-        #print(model)
-        cluster = model.clustering.predict([point])[0]
-        clusterUC = models[cluster].predict([point])[0]
-       # print("d3")
-        sub = [i for i in range(len(distribuicao)) if distribuicao[i] == cluster]
-       # print("d4")
-        for i in range(len(distribuicao)):
-            if distribuicao[i] == cluster:
-                clusterUC -= 1
-                flag = i
-            #    flag = distribuicao[i]
-            # [0,0,0,0,0,0,1,1,1,1,2,2,2,3,3,3,3,4,4,4]
+        w = delivery.size
+        cluster = model.clustering.predict([[delivery.point.lng, delivery.point.lat]])[0]
+        subcluster = model.subclustering[cluster].predict([[delivery.point.lng, delivery.point.lat]])[0]
 
-            if clusterUC < 0:
-                j_min = flag
-                break
-        
-      #  print(f"cluster: {cluster}", end= " ")
-      #  for j in sub:
-      #      print(f"uc {j}: {len(UCS[j].deliveries)}  || ", end= " ")
-      #  print("\n")
+        j_min = model.list_distribute.index(cluster) + subcluster
 
-        if UCS[j_min].C + delivery.size > Q:
-            logger.info(f"Despachando Unidade de Carregamento {j_min}.")
-            inst = create_instanceCVRP(instance, UCS[j_min].deliveries, instance.name, 3)
-            R.append(inst)
+        if UCS[j_min].C + w > instance.vehicle_capacity:
+            logger.info(f"Despachando Unidades de Carregamento {j_min}.")
+            instances_cvrp.append(CVRPInstance(name = instance.name,
+                                    region= "",
+                                    origin= instance.origin,
+                                    vehicle_capacity = 3 * instance.vehicle_capacity,
+                                    deliveries= UCS[j_min].deliveries))
             UCS[j_min].C = 0
             UCS[j_min].deliveries = []
 
-
-        UCS[j_min].C = UCS[j_min].C + delivery.size
+        UCS[j_min].C = UCS[j_min].C + w
         UCS[j_min].deliveries.append(delivery)
 
-    logger.info("Despachando Unidades de Carregamento que não chegaram ao limite.")
-    for i in range(model.clustering.n_clusters): # ucs restantes que nao atingiram a capacidade Q
-        sub = [j for j in range(len(distribuicao)) if distribuicao[j]==i]
-        for j in sub:
-            if len(UCS[j].deliveries) > 0:
-                inst = create_instanceCVRP(instance, UCS[j].deliveries, instance.name, 3)
-                R.append(inst)
-                
-    for inst in R:
-        sol = ortools_solve(inst, params.ortools_tsp_params)# TSP
-        while not isinstance(sol, CVRPSolution):
-            logger.info(f"SOLUÇÃO NONETYPE. Buscando novamente. {instance.name}")
-            sol = ortools_solve(inst, params.ortools_tsp_params)# TSP
-        vehicles.append(CVRPSolutionVehicle(instance.origin, sol.deliveries))
+    instances_cvrp = instances_icvrp(instance, model, UCS, instances_cvrp)
+    solutions_cvrp = solutions_icvrp(model, instances_cvrp, solutions_cvrp )
 
     return CVRPSolution(
         name=instance.name,
-        vehicles= vehicles,
+        vehicles= solutions_cvrp,
     )
-
 
 
 if __name__ == "__main__":
@@ -257,7 +259,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--train_instances", type=str, required=True)    
     parser.add_argument("--eval_instances", type=str, required=True)
-    parser.add_argument("--output", type=str)
+    # parser.add_argument("--output", type=str)
     parser.add_argument("--params", type=str)
 
     args = parser.parse_args()
@@ -275,77 +277,21 @@ if __name__ == "__main__":
         [train_path] if train_path.is_file() else list(train_path.iterdir())
     )
 
-
-    params = CHParams.from_file(args.params) if args.params else CHParams.get_baseline()
+    params = Params.from_file(args.params) if args.params else Params.get_baseline()
     print(params)
+
     train_instances = [CVRPInstance.from_file(f) for f in train_files[:240]]
 
     logger.info("Pretraining on training instances.")
-
-    # primeiro nivel
     model = pretrain(train_instances, params)
 
-
-    cidade = str(eval_path).split("/")
-    cidade = cidade[len(cidade)-1]
-    out = f"{args.output}/{cidade}/clusters_{model.clustering.n_clusters}" if args.output else None
-   # outInstances = f"{args.output}/instances" if args.output else None
-    
-    output_dir = Path(out or ".")
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # juntando todas as entregas de todas as instancias
-    deliveries = np.array(
-        [
-            d
-            for instance in train_instances
-            for d in instance.deliveries
-        ]
-    )
-
-    logger.info(f"Total de entregas: {len(deliveries)}")
-
-    
-
-    #instanciaGeral =  create_instanceCVRP(CVRPInstance.from_file(eval_files[0]), deliveries, "instanceGeral", 1)
-    #instancesTest = [instanciaGeral]
-    #logger.info("Separando as entregas em seus respectivos clusters")
-    #points_clusters = [[] for i in range(model.clustering.n_clusters)]
-    #for delivery in deliveries:
-    #    cluster = model.clustering.predict([[delivery.point.lng, delivery.point.lat]])[0]
-    #    points_clusters[cluster].append(delivery)
-
-    #logger.info("Criando as instances_clusters")
-    #instances = []
-    #for cluster in range(len(points_clusters)):
-     #   name = f"cluster_{cluster}"
-    #    instanceCluster = create_instanceCVRP(train_instances[0], points_clusters[cluster], name, 1)
-    #    instances.append(instanceCluster)
-    #    print(len(instanceCluster.deliveries))
-    #print(len(instances))
-
-    somaClusters, pointsClusters = qtdClusters(deliveries, model)
-    print(somaClusters)
-
-    logger.info("Fazendo a distribuição das Unidades de Carregamento")
-    #distribuicao, dictDistribuicao = uc_distribute(params.num_ucs, instances)
-    #print()
-
-    # distribuicao 
-    distribuicao, dictDistribuicao = uc_distribute(params.num_ucs, somaClusters)
-    # models = modelsUC(instances, dictDistribuicao)
-
-    # segundo nivel
-    models = modelsUC2(deliveries, dictDistribuicao, model.clustering.n_clusters, pointsClusters)
-    
-    #plotModels(models, deliveries, model)
     manager = Manager()
     results = manager.list()
 
     def solve(file):
         instance = CVRPInstance.from_file(file)
         logger.info(f"Alocando entregas: {instance.name}")
-        solution = aloc(instance, model, params, distribuicao, models)
+        solution = alocation(instance, model)
         distance = evaluate_solution(instance, solution)
         #solution.to_file((output_dir / f"{instance.name}.json"))
         print(distance)
@@ -353,33 +299,20 @@ if __name__ == "__main__":
         results.append(res)
 
 
-    inicio = time.time()
-
-    # caso haja problema no tqdm
-    for eval in eval_files:
-        solve(eval)
-
     # Run solver on multiprocessing pool.
-    #with Pool(os.cpu_count()) as pool:
-    #    list(tqdm(pool.imap(solve, eval_files), total=len(eval_files)))
+    with Pool(os.cpu_count()) as pool:
+        list(tqdm(pool.imap(solve, eval_files), total=len(eval_files)))
 
-    final = time.time()
-
-
-
-    # AVALIANDO 
-
-    print(f"{eval_path}_{model.clustering.n_clusters}", "Clusterizacao Hierarquica")
+    print(f"{eval_path}_{model.clustering.n_clusters}", "AS")
 
     porcs = []
     for instance, distance in results:
         porc = (distance/dictOffilinePA0[instance])*100 - 100
         porcs.append(porc)
         print(f"{instance} ({distance} km)")
-    soma = 0
+    sum_distribute = 0
     for p in porcs:
-        soma += p
+        sum_distribute += p
     
-    print("media:",soma/len(porcs))
-
-    print("tempo: ", final - inicio)
+    print("media:",sum_distribute/len(porcs))
+    
