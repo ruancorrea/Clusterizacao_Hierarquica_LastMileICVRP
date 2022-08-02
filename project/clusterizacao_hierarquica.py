@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
 
 import numpy as np
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, MiniBatchKMeans
 
 from loggibud.v1.types import (
     CVRPInstance,
@@ -24,6 +24,9 @@ from loggibud.v1.baselines.shared.ortools import (
     solve as ortools_solve,
     ORToolsParams,
 )
+
+from TSP import solve as solve_tsp
+
 
 from loggibud.v1.eval.task1 import evaluate_solution
 
@@ -39,14 +42,12 @@ logger = logging.getLogger(__name__)
 @dataclass
 class UCModel:
     C: int
-    phi: List[Delivery]
     deliveries: List[Delivery]
 
     @classmethod
     def get_baseline(cls):
         return cls(
             C= 0,
-            phi= [],
             deliveries= []
         )
 
@@ -118,9 +119,7 @@ def get_distributing(
 # o balanceamento busca remover UC do primeiro cluster que tem mais que uma UC.
 # exemplo: C1: 10   |   C2: 3    |   C3:   1    |    C4: 2
 # sera removido uma UC do cluster C4
-def get_distributing2(
-    NUM_UCS: int, y_pred: List[int]
-):
+def get_distributing2(NUM_UCS: int, y_pred: List[int]):
     unique, counts = np.unique(y_pred, return_counts=True)
     tam_pools = {i: counts[i] for i in range(len(counts))}
     ordenado = sorted(tam_pools, key = tam_pools.get, reverse=True)
@@ -152,6 +151,21 @@ def get_distributing2(
 
 
 
+def get_subClusterings(points, y_pred: List[int], n_clusters: int, dict_distribute: Dict[int, int]):
+    pointsClusters = [[] for cluster in range(n_clusters) ]
+    subclusterings = [KMeans(n_clusters=dict_distribute[cluster], random_state=0) 
+              for cluster in range(n_clusters) ]
+
+    for i in range(len(y_pred)):
+        point = [points[i][0], points[i][1]]
+        pointsClusters[y_pred[i]].append(point)
+
+    for cluster in range(n_clusters):
+        subclusterings[cluster].fit(pointsClusters[cluster])
+
+    return subclusterings
+
+
 
 def pretrain(
     instances: List[CVRPInstance], params: Optional[Params] = None
@@ -174,15 +188,16 @@ def pretrain(
 
     y_pred = clustering.fit_predict(points)
 
-    list_distribute, dict_distribute = get_distributing(params.NUM_UCS, y_pred, num_clusters)
-    # list_distribute, dict_distribute = get_distributing2(params.NUM_UCS, y_pred)
+    #list_distribute, dict_distribute = get_distributing(params.NUM_UCS, y_pred, num_clusters)
+    list_distribute, dict_distribute = get_distributing2(params.NUM_UCS, y_pred)
 
     # criando modelos do segundo nivel da clusterização
-    subclusterings = [KMeans(dict_distribute[i], init='k-means++', random_state=params.seed)
-                        .fit(points[np.in1d(y_pred, [0])]) for i in range(num_clusters) ]
+    subclusterings = get_subClusterings(points, y_pred, clustering.n_clusters, dict_distribute)
+    
+    ##subclusterings = [KMeans(dict_distribute[i], init='k-means++', random_state=params.seed)
+    ##                    .fit(points[np.in1d(y_pred, [0])]) for i in range(num_clusters) ]
 
     print(dict_distribute)
-    print(subclusterings)
     return ParamsModel(
         params=params,
         list_distribute=list_distribute,
@@ -246,12 +261,17 @@ def alocation(instance: CVRPInstance, model: ParamsModel) -> CVRPSolution:
         UCS[j_min].deliveries.append(delivery)
 
     instances_cvrp = instances_icvrp(instance, model, UCS, instances_cvrp)
+    
+    #for ucs in range(len(instances_cvrp)):
+    #    instances_cvrp[ucs].to_file((output_dir / f"{instance.name}_{ucs}.json"))
+
     solutions_cvrp = solutions_icvrp(model, instances_cvrp, solutions_cvrp )
 
     return CVRPSolution(
         name=instance.name,
         vehicles= solutions_cvrp,
     )
+    
 
 
 if __name__ == "__main__":
@@ -261,7 +281,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--train_instances", type=str, required=True)    
     parser.add_argument("--eval_instances", type=str, required=True)
-    # parser.add_argument("--output", type=str)
+    parser.add_argument("--output", type=str)
     parser.add_argument("--params", type=str)
 
     args = parser.parse_args()
@@ -282,6 +302,9 @@ if __name__ == "__main__":
     params = Params.from_file(args.params) if args.params else Params.get_baseline()
     print(params)
 
+    output_dir = Path(args.output or ".")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     train_instances = [CVRPInstance.from_file(f) for f in train_files[:240]]
 
     logger.info("Pretraining on training instances.")
@@ -294,22 +317,26 @@ if __name__ == "__main__":
         instance = CVRPInstance.from_file(file)
         logger.info(f"Alocando entregas: {instance.name}")
         solution = alocation(instance, model)
+        
         distance = evaluate_solution(instance, solution)
-        #solution.to_file((output_dir / f"{instance.name}.json"))
-        print(distance)
+        # solution.to_file((output_dir / f"{instance.name}.json"))
+        print(instance.name, distance)
+        """
         res = (instance.name, distance)
         results.append(res)
+        """
 
 
     # Run solver on multiprocessing pool.
     with Pool(os.cpu_count()) as pool:
         list(tqdm(pool.imap(solve, eval_files), total=len(eval_files)))
-
+    
+    '''
     print(f"{eval_path}_{model.clustering.n_clusters}", "AS")
 
     porcs = []
     for instance, distance in results:
-        porc = (distance/dictOffilinePA0[instance])*100 - 100
+        porc = (distance/dictOffilineDF0[instance])*100 - 100
         porcs.append(porc)
         print(f"{instance} ({distance} km)")
     sum_distribute = 0
@@ -317,4 +344,5 @@ if __name__ == "__main__":
         sum_distribute += p
     
     print("media:",sum_distribute/len(porcs))
+    '''
     
