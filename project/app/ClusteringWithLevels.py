@@ -97,13 +97,11 @@ class ClusteringWithLevels:
             distribution[cluster] = loadings_units_count
             total_distributed_LUs = total_distributed_LUs + loadings_units_count
 
-        clusters_bigger_one = sorted(distribution, key = distribution.get, reverse=False)
         while total_distributed_LUs > self.params.num_loadings_units:
-            for cluster in clusters_bigger_one:
-                if distribution[cluster] > 1:
-                    distribution[cluster] = distribution[cluster] - 1
-                    total_distributed_LUs = total_distributed_LUs - 1
-                    break
+            cluster = max(distribution, key=distribution.get)
+            if distribution[cluster] > 1:
+                distribution[cluster] = distribution[cluster] - 1
+                total_distributed_LUs = total_distributed_LUs - 1
         return distribution
     
     def __get__dict_centroides(self) -> dict:
