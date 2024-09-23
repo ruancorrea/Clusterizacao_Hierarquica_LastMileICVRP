@@ -1,5 +1,0 @@
-poetry run python -m project.clusterizacao_hierarquica \
-    --eval_instances data/cvrp-instances-1.0/dev/pa-0 \
-    --train_instances data/cvrp-instances-1.0/train/pa-0 \
-    --output solutions \
-    --params project/params.json 
